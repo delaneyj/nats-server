@@ -9541,7 +9541,8 @@ func TestJetStreamClusterOfflineStreamAndConsumerAfterAssetCreateOrUpdate(t *tes
 		require_True(t, len(snap) > 0)
 		dec, err := s2.Decode(nil, snap)
 		require_NoError(t, err)
-		require_NoError(t, json.Unmarshal(dec, &wsas))
+		wsas, err = decodeMetaSnapshot(dec)
+		require_NoError(t, err)
 		return wsas
 	}
 
@@ -9846,7 +9847,8 @@ func TestJetStreamClusterOfflineStreamAndConsumerAfterDowngrade(t *testing.T) {
 		require_True(t, len(snap) > 0)
 		dec, err := s2.Decode(nil, snap)
 		require_NoError(t, err)
-		require_NoError(t, json.Unmarshal(dec, &wsas))
+		wsas, err = decodeMetaSnapshot(dec)
+		require_NoError(t, err)
 		return wsas
 	}
 
@@ -10068,7 +10070,8 @@ func TestJetStreamClusterOfflineStreamAndConsumerUpdate(t *testing.T) {
 		require_True(t, len(snap) > 0)
 		dec, err := s2.Decode(nil, snap)
 		require_NoError(t, err)
-		require_NoError(t, json.Unmarshal(dec, &wsas))
+		wsas, err = decodeMetaSnapshot(dec)
+		require_NoError(t, err)
 		return wsas
 	}
 
