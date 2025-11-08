@@ -35,6 +35,7 @@ import (
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
+	"github.com/nats-io/nats-server/v2/server/jetstream/metasnap"
 	"github.com/nats-io/nuid"
 )
 
@@ -304,16 +305,6 @@ func (uca *unsupportedConsumerAssignment) closeInfoSub(s *Server) {
 		uca.sysc.closeConnection(ClientClosed)
 		uca.sysc = nil
 	}
-}
-
-type writeableConsumerAssignment struct {
-	Client     *ClientInfo     `json:"client,omitempty"`
-	Created    time.Time       `json:"created"`
-	Name       string          `json:"name"`
-	Stream     string          `json:"stream"`
-	ConfigJSON json.RawMessage `json:"consumer"`
-	Group      *raftGroup      `json:"group"`
-	State      *ConsumerState  `json:"state,omitempty"`
 }
 
 // streamPurge is what the stream leader will replicate when purging a stream.
@@ -1591,15 +1582,6 @@ func (js *jetStream) checkClusterSize() {
 }
 
 // Represents our stable meta state that we can write out.
-type writeableStreamAssignment struct {
-	Client     *ClientInfo     `json:"client,omitempty"`
-	Created    time.Time       `json:"created"`
-	ConfigJSON json.RawMessage `json:"stream"`
-	Group      *raftGroup      `json:"group"`
-	Sync       string          `json:"sync"`
-	Consumers  []*writeableConsumerAssignment
-}
-
 func (js *jetStream) clusterStreamConfig(accName, streamName string) (StreamConfig, bool) {
 	js.mu.RLock()
 	defer js.mu.RUnlock()
@@ -1619,66 +1601,41 @@ func (js *jetStream) metaSnapshot() ([]byte, error) {
 	for _, asa := range cc.streams {
 		nsa += len(asa)
 	}
-	streams := make([]writeableStreamAssignment, 0, nsa)
+	snapshot := metasnap.MetaSnapshot{
+		Streams: make([]metasnap.StreamAssignment, 0, nsa),
+	}
 	for _, asa := range cc.streams {
 		for _, sa := range asa {
-			wsa := writeableStreamAssignment{
-				Client:     sa.Client.forAssignmentSnap(),
-				Created:    sa.Created,
-				ConfigJSON: sa.ConfigJSON,
-				Group:      sa.Group,
-				Sync:       sa.Sync,
-				Consumers:  make([]*writeableConsumerAssignment, 0, len(sa.consumers)),
-			}
-			for _, ca := range sa.consumers {
-				// Skip if the consumer is pending, we can't include it in our snapshot.
-				// If the proposal fails after we marked it pending, it would result in a ghost consumer.
-				if ca.pending {
-					continue
-				}
-				wca := writeableConsumerAssignment{
-					Client:     ca.Client.forAssignmentSnap(),
-					Created:    ca.Created,
-					Name:       ca.Name,
-					Stream:     ca.Stream,
-					ConfigJSON: ca.ConfigJSON,
-					Group:      ca.Group,
-					State:      ca.State,
-				}
-				wsa.Consumers = append(wsa.Consumers, &wca)
-				nca++
-			}
-			streams = append(streams, wsa)
+			wsa, consumers := encodeStreamAssignmentForSnapshot(sa)
+			nca += consumers
+			snapshot.Streams = append(snapshot.Streams, wsa)
 		}
 	}
 
-	if len(streams) == 0 {
+	if len(snapshot.Streams) == 0 {
 		js.mu.RUnlock()
 		return nil, nil
 	}
 
-	// Track how long it took to marshal the JSON
+	// Track how long it took to marshal the payload.
 	mstart := time.Now()
-	b, err := json.Marshal(streams)
+	buf := getPooledBuffer()
+	defer putPooledBuffer(buf)
+	raw := buf.WriteSlice(snapshot.Size())
+	snapshot.Marshal(raw)
 	mend := time.Since(mstart)
 
 	js.mu.RUnlock()
 
-	// Must not be possible for a JSON marshaling error to result
-	// in an empty snapshot.
-	if err != nil {
-		return nil, err
-	}
-
 	// Track how long it took to compress the JSON.
 	cstart := time.Now()
-	snap := s2.Encode(nil, b)
+	snap := s2.Encode(nil, raw)
 	cend := time.Since(cstart)
 	took := time.Since(start)
 
 	if took > time.Second {
 		s.rateLimitFormatWarnf("Metalayer snapshot took %.3fs (streams: %d, consumers: %d, marshal: %.3fs, s2: %.3fs, uncompressed: %d, compressed: %d)",
-			took.Seconds(), nsa, nca, mend.Seconds(), cend.Seconds(), len(b), len(snap))
+			took.Seconds(), nsa, nca, mend.Seconds(), cend.Seconds(), len(raw), len(snap))
 	}
 
 	// Track in jsz monitoring as well.
@@ -1691,36 +1648,37 @@ func (js *jetStream) metaSnapshot() ([]byte, error) {
 }
 
 func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecovering bool) error {
-	var wsas []writeableStreamAssignment
+	var snapshot metasnap.MetaSnapshot
 	if len(buf) > 0 {
-		jse, err := s2.Decode(nil, buf)
+		dbuf := getPooledBuffer()
+		jse, err := s2.Decode(dbuf.buf[:0], buf)
 		if err != nil {
+			putPooledBuffer(dbuf)
 			return err
 		}
-		if err = json.Unmarshal(jse, &wsas); err != nil {
+		if err := snapshot.Unmarshal(jse); err != nil {
+			putPooledBuffer(dbuf)
 			return err
 		}
+		putPooledBuffer(dbuf)
 	}
 
 	// Build our new version here outside of js.
 	streams := make(map[string]map[string]*streamAssignment)
-	for _, wsa := range wsas {
-		as := streams[wsa.Client.serviceAccount()]
+	for _, wsa := range snapshot.Streams {
+		sa := decodeStreamAssignmentFromSnapshot(wsa)
+		as := streams[sa.Client.serviceAccount()]
 		if as == nil {
 			as = make(map[string]*streamAssignment)
-			streams[wsa.Client.serviceAccount()] = as
+			streams[sa.Client.serviceAccount()] = as
 		}
-		sa := &streamAssignment{Client: wsa.Client, Created: wsa.Created, ConfigJSON: wsa.ConfigJSON, Group: wsa.Group, Sync: wsa.Sync}
 		decodeStreamAssignmentConfig(js.srv, sa)
-		if len(wsa.Consumers) > 0 {
-			sa.consumers = make(map[string]*consumerAssignment)
-			for _, wca := range wsa.Consumers {
-				if wca.Stream == _EMPTY_ {
-					wca.Stream = sa.Config.Name // Rehydrate from the stream name.
+		if len(sa.consumers) > 0 {
+			for _, ca := range sa.consumers {
+				if ca.Stream == _EMPTY_ {
+					ca.Stream = sa.Config.Name // Rehydrate from the stream name.
 				}
-				ca := &consumerAssignment{Client: wca.Client, Created: wca.Created, Name: wca.Name, Stream: wca.Stream, ConfigJSON: wca.ConfigJSON, Group: wca.Group, State: wca.State}
 				decodeConsumerAssignmentConfig(ca)
-				sa.consumers[ca.Name] = ca
 			}
 		}
 		as[sa.Config.Name] = sa

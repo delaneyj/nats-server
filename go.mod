@@ -6,6 +6,7 @@ toolchain go1.24.10
 
 require (
 	github.com/antithesishq/antithesis-sdk-go v0.4.3-default-no-op
+	github.com/deneonet/benc v1.1.8
 	github.com/google/go-tpm v0.9.6
 	github.com/klauspost/compress v1.18.1
 	github.com/minio/highwayhash v1.0.3
@@ -18,3 +19,7 @@ require (
 	golang.org/x/sys v0.37.0
 	golang.org/x/time v0.14.0
 )
+
+require golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa // indirect
+
+tool github.com/deneonet/benc/cmd/bencgen

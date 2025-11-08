@@ -37,8 +37,44 @@ import (
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats-server/v2/server/jetstream/metasnap"
 	"github.com/nats-io/nats.go"
 )
+
+type writeableConsumerAssignment struct {
+	ConfigJSON json.RawMessage
+	Name       string
+}
+
+type writeableStreamAssignment struct {
+	ConfigJSON json.RawMessage
+	Consumers  []*writeableConsumerAssignment
+}
+
+func decodeMetaSnapshotForTest(t *testing.T, snap []byte) []writeableStreamAssignment {
+	t.Helper()
+	dec, err := s2.Decode(nil, snap)
+	require_NoError(t, err)
+	var meta metasnap.MetaSnapshot
+	require_NoError(t, meta.Unmarshal(dec))
+	wsas := make([]writeableStreamAssignment, 0, len(meta.Streams))
+	for _, stream := range meta.Streams {
+		wsa := writeableStreamAssignment{
+			ConfigJSON: json.RawMessage(append([]byte(nil), stream.Stream_config...)),
+		}
+		if len(stream.Consumers) > 0 {
+			wsa.Consumers = make([]*writeableConsumerAssignment, 0, len(stream.Consumers))
+			for _, consumer := range stream.Consumers {
+				wsa.Consumers = append(wsa.Consumers, &writeableConsumerAssignment{
+					ConfigJSON: json.RawMessage(append([]byte(nil), consumer.Consumer_config...)),
+					Name:       consumer.Name,
+				})
+			}
+		}
+		wsas = append(wsas, wsa)
+	}
+	return wsas
+}
 
 func TestJetStreamClusterConfig(t *testing.T) {
 	conf := createConfFile(t, []byte(`
@@ -9534,15 +9570,12 @@ func TestJetStreamClusterOfflineStreamAndConsumerAfterAssetCreateOrUpdate(t *tes
 		sjs.mu.Unlock()
 	}
 
-	getValidMetaSnapshot := func() (wsas []writeableStreamAssignment) {
+	getValidMetaSnapshot := func() []writeableStreamAssignment {
 		t.Helper()
 		snap, err := sjs.metaSnapshot()
 		require_NoError(t, err)
 		require_True(t, len(snap) > 0)
-		dec, err := s2.Decode(nil, snap)
-		require_NoError(t, err)
-		require_NoError(t, json.Unmarshal(dec, &wsas))
-		return wsas
+		return decodeMetaSnapshotForTest(t, snap)
 	}
 
 	// Create a stream that's unsupported.
@@ -9839,15 +9872,12 @@ func TestJetStreamClusterOfflineStreamAndConsumerAfterDowngrade(t *testing.T) {
 		sjs.mu.Unlock()
 	}
 
-	getValidMetaSnapshot := func() (wsas []writeableStreamAssignment) {
+	getValidMetaSnapshot := func() []writeableStreamAssignment {
 		t.Helper()
 		snap, err := sjs.metaSnapshot()
 		require_NoError(t, err)
 		require_True(t, len(snap) > 0)
-		dec, err := s2.Decode(nil, snap)
-		require_NoError(t, err)
-		require_NoError(t, json.Unmarshal(dec, &wsas))
-		return wsas
+		return decodeMetaSnapshotForTest(t, snap)
 	}
 
 	// Create a stream that's unsupported.
@@ -10061,15 +10091,12 @@ func TestJetStreamClusterOfflineStreamAndConsumerUpdate(t *testing.T) {
 		return nil
 	})
 
-	getValidMetaSnapshot := func() (wsas []writeableStreamAssignment) {
+	getValidMetaSnapshot := func() []writeableStreamAssignment {
 		t.Helper()
 		snap, err := sjs.metaSnapshot()
 		require_NoError(t, err)
 		require_True(t, len(snap) > 0)
-		dec, err := s2.Decode(nil, snap)
-		require_NoError(t, err)
-		require_NoError(t, json.Unmarshal(dec, &wsas))
-		return wsas
+		return decodeMetaSnapshotForTest(t, snap)
 	}
 
 	wsas := getValidMetaSnapshot()
