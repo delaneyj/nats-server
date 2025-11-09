@@ -239,6 +239,7 @@ func decodeConsumerAssignmentFromSnapshot(ca metasnap.ConsumerAssignment) *consu
 	if ca.Has_state {
 		decoded.State = decodeConsumerStateFromSnapshot(ca.State)
 	}
+	ensureConsumerAssignmentConfig(decoded)
 	return decoded
 }
 
@@ -293,5 +294,28 @@ func decodeStreamAssignmentFromSnapshot(sa metasnap.StreamAssignment) *streamAss
 			decoded.consumers[ca.Name] = ca
 		}
 	}
+	ensureStreamAssignmentConfig(decoded)
 	return decoded
+}
+
+func ensureStreamAssignmentConfig(sa *streamAssignment) {
+	if sa == nil || sa.Config != nil || len(sa.ConfigJSON) == 0 {
+		return
+	}
+	var cfg StreamConfig
+	if err := json.Unmarshal(sa.ConfigJSON, &cfg); err != nil {
+		return
+	}
+	sa.Config = &cfg
+}
+
+func ensureConsumerAssignmentConfig(ca *consumerAssignment) {
+	if ca == nil || ca.Config != nil || len(ca.ConfigJSON) == 0 {
+		return
+	}
+	var cfg ConsumerConfig
+	if err := json.Unmarshal(ca.ConfigJSON, &cfg); err != nil {
+		return
+	}
+	ca.Config = &cfg
 }

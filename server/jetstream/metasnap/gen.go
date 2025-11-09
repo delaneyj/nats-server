@@ -13,4 +13,4 @@
 
 package metasnap
 
-//go:generate go tool bencgen --in schema/meta_snapshot.benc --lang go --out . --file meta_snapshot_gen
+//go:generate go tool bencgen --in schema/meta_snapshot.benc --lang go --out . --file meta_snapshot_gen --force
