@@ -29,8 +29,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
+    "time"
 
+    "github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats-server/v2/internal/fastrand"
 	"github.com/nats-io/nats.go"
 )
@@ -1336,6 +1337,210 @@ func BenchmarkJetStreamCounters(b *testing.B) {
 			}
 		})
 	}
+}
+
+// Benchmark encode/decode performance for JSON vs msgp on the meta snapshot payload.
+func BenchmarkMetaSnapshotEncodeDecode(b *testing.B) {
+    c := createJetStreamClusterExplicit(b, "R3S", 3)
+    defer c.shutdown()
+
+    // Reuse the same setup as the encode benchmark to generate a realistic dataset.
+    setup := func(reqLevel string) (*jetStream, []writeableStreamAssignment, []metaStreamAssignment) {
+        ml := c.leader()
+        acc, js := ml.globalAccount(), ml.getJetStream()
+        n := js.getMetaGroup()
+
+        // Create streams and consumers.
+        numStreams := 200
+        numConsumers := 500
+        ci := &ClientInfo{Cluster: "R3S", Account: globalAccountName}
+        js.mu.Lock()
+        metadata := map[string]string{JSRequiredLevelMetadataKey: reqLevel}
+        for i := 0; i < numStreams; i++ {
+            scfg := &StreamConfig{
+                Name:     fmt.Sprintf("STREAM-%d", i),
+                Subjects: []string{fmt.Sprintf("SUBJECT-%d", i)},
+                Storage:  MemoryStorage,
+                Metadata: metadata,
+            }
+            cfg, _ := ml.checkStreamCfg(scfg, acc, false)
+            rg, _ := js.createGroupForStream(ci, &cfg)
+            sa := &streamAssignment{Group: rg, Sync: syncSubjForStream(), Config: &cfg, Client: ci, Created: time.Now().UTC()}
+            n.Propose(encodeAddStreamAssignment(sa))
+
+            for j := 0; j < numConsumers; j++ {
+                ccfg := &ConsumerConfig{
+                    Durable:       fmt.Sprintf("CONSUMER-%d", j),
+                    MemoryStorage: true,
+                    Metadata:      metadata,
+                }
+                selectedLimits, _, _, _ := acc.selectLimits(ccfg.replicas(&cfg))
+                srvLim := &ml.getOpts().JetStreamLimits
+                setConsumerConfigDefaults(ccfg, &cfg, srvLim, selectedLimits, false)
+                rg = js.cluster.createGroupForConsumer(ccfg, sa)
+                ca := &consumerAssignment{Group: rg, Stream: cfg.Name, Name: ccfg.Durable, Config: ccfg, Client: ci, Created: time.Now().UTC()}
+                n.Propose(encodeAddConsumerAssignment(ca))
+            }
+        }
+        js.mu.Unlock()
+
+        // Wait for all servers to have created all assets.
+        checkFor(b, 20*time.Second, 200*time.Millisecond, func() error {
+            for _, s := range c.servers {
+                sjs := s.getJetStream()
+                sjs.mu.RLock()
+                streams := sjs.cluster.streams[globalAccountName]
+                if len(streams) != numStreams {
+                    sjs.mu.RUnlock()
+                    return fmt.Errorf("expected %d streams, got %d", numStreams, len(streams))
+                }
+                for _, sa := range streams {
+                    if nc := len(sa.consumers); nc != numConsumers {
+                        sjs.mu.RUnlock()
+                        return fmt.Errorf("expected %d consumers, got %d", numConsumers, nc)
+                    }
+                }
+                sjs.mu.RUnlock()
+            }
+            return nil
+        })
+
+        // Build both JSON-native and msgp codec payloads.
+        js.mu.RLock()
+        defer js.mu.RUnlock()
+        cc := js.cluster
+        // Construct writeableStreamAssignment slice.
+        var jsonStreams []writeableStreamAssignment
+        var msgpStreams []metaStreamAssignment
+        for _, asa := range cc.streams {
+            for _, sa := range asa {
+                wsa := writeableStreamAssignment{
+                    Client:     sa.Client.forAssignmentSnap(),
+                    Created:    sa.Created,
+                    ConfigJSON: sa.ConfigJSON,
+                    Group:      sa.Group,
+                    Sync:       sa.Sync,
+                    Consumers:  make([]*writeableConsumerAssignment, 0, len(sa.consumers)),
+                }
+                ms := metaStreamAssignment{
+                    Client:     metaClient{Account: sa.Client.Account, Service: sa.Client.Service, Cluster: sa.Client.Cluster},
+                    CreatedNS:  sa.Created.UnixNano(),
+                    ConfigJSON: []byte(sa.ConfigJSON),
+                    Group:      metaRaftGroup{Name: sa.Group.Name, Peers: sa.Group.Peers, Storage: uint8(sa.Group.Storage), Cluster: sa.Group.Cluster, Preferred: sa.Group.Preferred, ScaleUp: sa.Group.ScaleUp},
+                    Sync:       sa.Sync,
+                    Consumers:  make([]metaConsumerAssignment, 0, len(sa.consumers)),
+                }
+                for _, ca := range sa.consumers {
+                    if ca.pending {
+                        continue
+                    }
+                    wca := writeableConsumerAssignment{
+                        Client:     ca.Client.forAssignmentSnap(),
+                        Created:    ca.Created,
+                        Name:       ca.Name,
+                        Stream:     ca.Stream,
+                        ConfigJSON: ca.ConfigJSON,
+                        Group:      ca.Group,
+                        State:      ca.State,
+                    }
+                    var state []byte
+                    if ca.State != nil {
+                        state = encodeConsumerState(ca.State)
+                    }
+                    mc := metaConsumerAssignment{
+                        Client:     metaClient{Account: ca.Client.Account, Service: ca.Client.Service, Cluster: ca.Client.Cluster},
+                        CreatedNS:  ca.Created.UnixNano(),
+                        Name:       ca.Name,
+                        Stream:     ca.Stream,
+                        ConfigJSON: []byte(ca.ConfigJSON),
+                        Group:      metaRaftGroup{Name: ca.Group.Name, Peers: ca.Group.Peers, Storage: uint8(ca.Group.Storage), Cluster: ca.Group.Cluster, Preferred: ca.Group.Preferred, ScaleUp: ca.Group.ScaleUp},
+                        State:      state,
+                    }
+                    wsa.Consumers = append(wsa.Consumers, &wca)
+                    ms.Consumers = append(ms.Consumers, mc)
+                }
+                jsonStreams = append(jsonStreams, wsa)
+                msgpStreams = append(msgpStreams, ms)
+            }
+        }
+        return js, jsonStreams, msgpStreams
+    }
+
+    for _, t := range []struct {
+        title    string
+        reqLevel string
+    }{
+        {title: "Default", reqLevel: "0"},
+        {title: "AllUnsupported", reqLevel: strconv.Itoa(math.MaxInt)},
+    } {
+        b.Run(t.title, func(b *testing.B) {
+            _, jsonStreams, msgpStreams := setup(t.reqLevel)
+
+            // Precompute payloads for decode benchmarks
+            jsonPayload, _ := json.Marshal(jsonStreams)
+            msgpPayload, _ := wsaList(msgpStreams).MarshalMsg(nil)
+            // And their S2-compressed forms
+            jsonS2 := s2.Encode(nil, jsonPayload)
+            msgpS2 := s2.Encode(nil, msgpPayload)
+
+            b.Run("JSON/Encode", func(b *testing.B) {
+                b.ReportAllocs()
+                for i := 0; i < b.N; i++ {
+                    _, _ = json.Marshal(jsonStreams)
+                }
+            })
+            b.Run("JSON/Decode", func(b *testing.B) {
+                b.ReportAllocs()
+                var tmp []writeableStreamAssignment
+                for i := 0; i < b.N; i++ {
+                    _ = json.Unmarshal(jsonPayload, &tmp)
+                }
+            })
+            b.Run("MSGP/Encode", func(b *testing.B) {
+                b.ReportAllocs()
+                for i := 0; i < b.N; i++ {
+                    _, _ = wsaList(msgpStreams).MarshalMsg(nil)
+                }
+            })
+            b.Run("MSGP/Decode", func(b *testing.B) {
+                b.ReportAllocs()
+                var lst wsaList
+                for i := 0; i < b.N; i++ {
+                    _, _ = lst.UnmarshalMsg(msgpPayload)
+                }
+            })
+            b.Run("JSON/Encode+S2", func(b *testing.B) {
+                b.ReportAllocs()
+                for i := 0; i < b.N; i++ {
+                    jb, _ := json.Marshal(jsonStreams)
+                    _ = s2.Encode(nil, jb)
+                }
+            })
+            b.Run("JSON/Decode+S2", func(b *testing.B) {
+                b.ReportAllocs()
+                var tmp []writeableStreamAssignment
+                for i := 0; i < b.N; i++ {
+                    jb, _ := s2.Decode(nil, jsonS2)
+                    _ = json.Unmarshal(jb, &tmp)
+                }
+            })
+            b.Run("MSGP/Encode+S2", func(b *testing.B) {
+                b.ReportAllocs()
+                for i := 0; i < b.N; i++ {
+                    mb, _ := wsaList(msgpStreams).MarshalMsg(nil)
+                    _ = s2.Encode(nil, mb)
+                }
+            })
+            b.Run("MSGP/Decode+S2", func(b *testing.B) {
+                b.ReportAllocs()
+                var lst wsaList
+                for i := 0; i < b.N; i++ {
+                    mb, _ := s2.Decode(nil, msgpS2)
+                    _, _ = lst.UnmarshalMsg(mb)
+                }
+            })
+        })
+    }
 }
 
 func BenchmarkJetStreamInterestStreamWithLimit(b *testing.B) {

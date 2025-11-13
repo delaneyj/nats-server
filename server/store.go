@@ -373,22 +373,22 @@ type ConsumerStore interface {
 
 // SequencePair has both the consumer and the stream sequence. They point to same message.
 type SequencePair struct {
-	Consumer uint64 `json:"consumer_seq"`
-	Stream   uint64 `json:"stream_seq"`
+    Consumer uint64 `json:"consumer_seq" msg:"consumer_seq"`
+    Stream   uint64 `json:"stream_seq" msg:"stream_seq"`
 }
 
 // ConsumerState represents a stored state for a consumer.
 type ConsumerState struct {
-	// Delivered keeps track of last delivered sequence numbers for both the stream and the consumer.
-	Delivered SequencePair `json:"delivered"`
-	// AckFloor keeps track of the ack floors for both the stream and the consumer.
-	AckFloor SequencePair `json:"ack_floor"`
-	// These are both in stream sequence context.
-	// Pending is for all messages pending and the timestamp for the delivered time.
-	// This will only be present when the AckPolicy is ExplicitAck.
-	Pending map[uint64]*Pending `json:"pending,omitempty"`
-	// This is for messages that have been redelivered, so count > 1.
-	Redelivered map[uint64]uint64 `json:"redelivered,omitempty"`
+    // Delivered keeps track of last delivered sequence numbers for both the stream and the consumer.
+    Delivered SequencePair `json:"delivered" msg:"delivered"`
+    // AckFloor keeps track of the ack floors for both the stream and the consumer.
+    AckFloor SequencePair `json:"ack_floor" msg:"ack_floor"`
+    // These are both in stream sequence context.
+    // Pending is for all messages pending and the timestamp for the delivered time.
+    // This will only be present when the AckPolicy is ExplicitAck.
+    Pending map[uint64]*Pending `json:"pending,omitempty" msg:"pending,omitempty"`
+    // This is for messages that have been redelivered, so count > 1.
+    Redelivered map[uint64]uint64 `json:"redelivered,omitempty" msg:"redelivered,omitempty"`
 }
 
 // Encode consumer state.
@@ -457,8 +457,8 @@ func encodeConsumerState(state *ConsumerState) []byte {
 // Represents a pending message for explicit ack or ack all.
 // Sequence is the original consumer sequence.
 type Pending struct {
-	Sequence  uint64
-	Timestamp int64
+    Sequence  uint64 `msg:"sequence"`
+    Timestamp int64  `msg:"timestamp"`
 }
 
 // TemplateStore stores templates.

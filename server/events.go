@@ -306,28 +306,28 @@ func (si *ServerInfo) AccountNRG() bool {
 
 // ClientInfo is detailed information about the client forming a connection.
 type ClientInfo struct {
-	Start      *time.Time    `json:"start,omitempty"`
-	Host       string        `json:"host,omitempty"`
-	ID         uint64        `json:"id,omitempty"`
-	Account    string        `json:"acc,omitempty"`
-	Service    string        `json:"svc,omitempty"`
-	User       string        `json:"user,omitempty"`
-	Name       string        `json:"name,omitempty"`
-	Lang       string        `json:"lang,omitempty"`
-	Version    string        `json:"ver,omitempty"`
-	RTT        time.Duration `json:"rtt,omitempty"`
-	Server     string        `json:"server,omitempty"`
-	Cluster    string        `json:"cluster,omitempty"`
-	Alternates []string      `json:"alts,omitempty"`
-	Stop       *time.Time    `json:"stop,omitempty"`
-	Jwt        string        `json:"jwt,omitempty"`
-	IssuerKey  string        `json:"issuer_key,omitempty"`
-	NameTag    string        `json:"name_tag,omitempty"`
-	Tags       jwt.TagList   `json:"tags,omitempty"`
-	Kind       string        `json:"kind,omitempty"`
-	ClientType string        `json:"client_type,omitempty"`
-	MQTTClient string        `json:"client_id,omitempty"` // This is the MQTT client ID
-	Nonce      string        `json:"nonce,omitempty"`
+    Start      *time.Time    `json:"start,omitempty" msg:"-"`
+    Host       string        `json:"host,omitempty" msg:"-"`
+    ID         uint64        `json:"id,omitempty" msg:"-"`
+    Account    string        `json:"acc,omitempty" msg:"acc,omitempty"`
+    Service    string        `json:"svc,omitempty" msg:"svc,omitempty"`
+    User       string        `json:"user,omitempty" msg:"-"`
+    Name       string        `json:"name,omitempty" msg:"-"`
+    Lang       string        `json:"lang,omitempty" msg:"-"`
+    Version    string        `json:"ver,omitempty" msg:"-"`
+    RTT        time.Duration `json:"rtt,omitempty" msg:"-"`
+    Server     string        `json:"server,omitempty" msg:"-"`
+    Cluster    string        `json:"cluster,omitempty" msg:"cluster,omitempty"`
+    Alternates []string      `json:"alts,omitempty" msg:"-"`
+    Stop       *time.Time    `json:"stop,omitempty" msg:"-"`
+    Jwt        string        `json:"jwt,omitempty" msg:"-"`
+    IssuerKey  string        `json:"issuer_key,omitempty" msg:"-"`
+    NameTag    string        `json:"name_tag,omitempty" msg:"-"`
+    Tags       jwt.TagList   `json:"tags,omitempty" msg:"-"`
+    Kind       string        `json:"kind,omitempty" msg:"-"`
+    ClientType string        `json:"client_type,omitempty" msg:"-"`
+    MQTTClient string        `json:"client_id,omitempty" msg:"-"` // This is the MQTT client ID
+    Nonce      string        `json:"nonce,omitempty" msg:"-"`
 }
 
 // forAssignmentSnap returns the minimum amount of ClientInfo we need for assignment snapshots.

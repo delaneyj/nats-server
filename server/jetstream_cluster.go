@@ -126,13 +126,15 @@ const (
 
 // raftGroups are controlled by the metagroup controller.
 // The raftGroups will house streams and consumers.
+// raftGroups are controlled by the metagroup controller.
+// The raftGroups will house streams and consumers.
 type raftGroup struct {
-	Name      string      `json:"name"`
-	Peers     []string    `json:"peers"`
-	Storage   StorageType `json:"store"`
-	Cluster   string      `json:"cluster,omitempty"`
-	Preferred string      `json:"preferred,omitempty"`
-	ScaleUp   bool        `json:"scale_up,omitempty"`
+	Name      string      `json:"name" msg:"name"`
+	Peers     []string    `json:"peers" msg:"peers"`
+	Storage   StorageType `json:"store" msg:"store"`
+	Cluster   string      `json:"cluster,omitempty" msg:"cluster,omitempty"`
+	Preferred string      `json:"preferred,omitempty" msg:"preferred,omitempty"`
+	ScaleUp   bool        `json:"scale_up,omitempty" msg:"scale_up,omitempty"`
 	// Internal
 	node RaftNode
 }
@@ -307,13 +309,13 @@ func (uca *unsupportedConsumerAssignment) closeInfoSub(s *Server) {
 }
 
 type writeableConsumerAssignment struct {
-	Client     *ClientInfo     `json:"client,omitempty"`
-	Created    time.Time       `json:"created"`
-	Name       string          `json:"name"`
-	Stream     string          `json:"stream"`
-	ConfigJSON json.RawMessage `json:"consumer"`
-	Group      *raftGroup      `json:"group"`
-	State      *ConsumerState  `json:"state,omitempty"`
+	Client     *ClientInfo     `json:"client,omitempty" msg:"client,omitempty"`
+	Created    time.Time       `json:"created" msg:"created"`
+	Name       string          `json:"name" msg:"name"`
+	Stream     string          `json:"stream" msg:"stream"`
+	ConfigJSON json.RawMessage `json:"consumer" msg:"consumer"`
+	Group      *raftGroup      `json:"group" msg:"group"`
+	State      *ConsumerState  `json:"state,omitempty" msg:"state,omitempty"`
 }
 
 // streamPurge is what the stream leader will replicate when purging a stream.
@@ -1592,13 +1594,19 @@ func (js *jetStream) checkClusterSize() {
 
 // Represents our stable meta state that we can write out.
 type writeableStreamAssignment struct {
-	Client     *ClientInfo     `json:"client,omitempty"`
-	Created    time.Time       `json:"created"`
-	ConfigJSON json.RawMessage `json:"stream"`
-	Group      *raftGroup      `json:"group"`
-	Sync       string          `json:"sync"`
+	Client     *ClientInfo     `json:"client,omitempty" msg:"client,omitempty"`
+	Created    time.Time       `json:"created" msg:"created"`
+	ConfigJSON json.RawMessage `json:"stream" msg:"stream"`
+	Group      *raftGroup      `json:"group" msg:"group"`
+	Sync       string          `json:"sync" msg:"sync"`
 	Consumers  []*writeableConsumerAssignment
 }
+
+// Slice alias for writeableStreamAssignment to enable efficient msgpack encode/decode.
+type wsList []writeableStreamAssignment
+
+//msgp:encode wsList
+//msgp:decode wsList
 
 func (js *jetStream) clusterStreamConfig(accName, streamName string) (StreamConfig, bool) {
 	js.mu.RLock()
@@ -1657,9 +1665,38 @@ func (js *jetStream) metaSnapshot() ([]byte, error) {
 		return nil, nil
 	}
 
-	// Track how long it took to marshal the JSON
+	// Convert to codec meta types for msgpack encode
+	metas := make([]metaStreamAssignment, 0, len(streams))
+	for _, s := range streams {
+		ms := metaStreamAssignment{
+			Client:     metaClient{Account: s.Client.Account, Service: s.Client.Service, Cluster: s.Client.Cluster},
+			CreatedNS:  s.Created.UnixNano(),
+			ConfigJSON: []byte(s.ConfigJSON),
+			Group:      metaRaftGroup{Name: s.Group.Name, Peers: s.Group.Peers, Storage: uint8(s.Group.Storage), Cluster: s.Group.Cluster, Preferred: s.Group.Preferred, ScaleUp: s.Group.ScaleUp},
+			Sync:       s.Sync,
+			Consumers:  make([]metaConsumerAssignment, 0, len(s.Consumers)),
+		}
+		for _, c := range s.Consumers {
+			var state []byte
+			if c.State != nil {
+				state = encodeConsumerState(c.State)
+			}
+			ms.Consumers = append(ms.Consumers, metaConsumerAssignment{
+				Client:     metaClient{Account: c.Client.Account, Service: c.Client.Service, Cluster: c.Client.Cluster},
+				CreatedNS:  c.Created.UnixNano(),
+				Name:       c.Name,
+				Stream:     c.Stream,
+				ConfigJSON: []byte(c.ConfigJSON),
+				Group:      metaRaftGroup{Name: c.Group.Name, Peers: c.Group.Peers, Storage: uint8(c.Group.Storage), Cluster: c.Group.Cluster, Preferred: c.Group.Preferred, ScaleUp: c.Group.ScaleUp},
+				State:      state,
+			})
+		}
+		metas = append(metas, ms)
+	}
+
+	// Track how long it took to msgpack-encode (no pooling)
 	mstart := time.Now()
-	b, err := json.Marshal(streams)
+	b, err := wsaList(metas).MarshalMsg(nil)
 	mend := time.Since(mstart)
 
 	js.mu.RUnlock()
@@ -1670,9 +1707,9 @@ func (js *jetStream) metaSnapshot() ([]byte, error) {
 		return nil, err
 	}
 
-	// Track how long it took to compress the JSON.
+	// No compression: return raw msgpack payload
 	cstart := time.Now()
-	snap := s2.Encode(nil, b)
+	snap := b
 	cend := time.Since(cstart)
 	took := time.Since(start)
 
@@ -1693,14 +1730,52 @@ func (js *jetStream) metaSnapshot() ([]byte, error) {
 func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecovering bool) error {
 	var wsas []writeableStreamAssignment
 	if len(buf) > 0 {
-		jse, err := s2.Decode(nil, buf)
-		if err != nil {
-			return err
+		// Accept both raw (no compression) and legacy s2-compressed payloads.
+		raw := buf
+		if dec, err := s2.Decode(nil, buf); err == nil {
+			raw = dec
 		}
-		if err = json.Unmarshal(jse, &wsas); err != nil {
-			return err
+		var lst wsaList
+		if _, err := lst.UnmarshalMsg(raw); err != nil {
+			// Fallback to legacy JSON format if msgpack decode fails.
+			if jerr := json.Unmarshal(raw, &wsas); jerr != nil {
+				return err
+			}
+			// If legacy JSON succeeded, skip msgpack conversion path.
+			goto BUILD
+		}
+		// Convert from meta types back to native writeable types
+		for _, ms := range lst {
+			wsa := writeableStreamAssignment{
+				Client:     &ClientInfo{Account: ms.Client.Account, Service: ms.Client.Service, Cluster: ms.Client.Cluster},
+				Created:    time.Unix(0, ms.CreatedNS).UTC(),
+				ConfigJSON: json.RawMessage(ms.ConfigJSON),
+				Group:      &raftGroup{Name: ms.Group.Name, Peers: ms.Group.Peers, Storage: StorageType(ms.Group.Storage), Cluster: ms.Group.Cluster, Preferred: ms.Group.Preferred, ScaleUp: ms.Group.ScaleUp},
+				Sync:       ms.Sync,
+				Consumers:  make([]*writeableConsumerAssignment, 0, len(ms.Consumers)),
+			}
+			for _, mc := range ms.Consumers {
+				var state *ConsumerState
+				if len(mc.State) > 0 {
+					if cs, err := decodeConsumerState(mc.State); err == nil {
+						state = cs
+					}
+				}
+				wca := &writeableConsumerAssignment{
+					Client:     &ClientInfo{Account: mc.Client.Account, Service: mc.Client.Service, Cluster: mc.Client.Cluster},
+					Created:    time.Unix(0, mc.CreatedNS).UTC(),
+					Name:       mc.Name,
+					Stream:     mc.Stream,
+					ConfigJSON: json.RawMessage(mc.ConfigJSON),
+					Group:      &raftGroup{Name: mc.Group.Name, Peers: mc.Group.Peers, Storage: StorageType(mc.Group.Storage), Cluster: mc.Group.Cluster, Preferred: mc.Group.Preferred, ScaleUp: mc.Group.ScaleUp},
+					State:      state,
+				}
+				wsa.Consumers = append(wsa.Consumers, wca)
+			}
+			wsas = append(wsas, wsa)
 		}
 	}
+BUILD:
 
 	// Build our new version here outside of js.
 	streams := make(map[string]map[string]*streamAssignment)
