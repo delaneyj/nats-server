@@ -53,22 +53,21 @@ type StreamConfig struct {
 	Description  string           `json:"description,omitempty"`
 	Subjects     []string         `json:"subjects,omitempty"`
 	Retention    RetentionPolicy  `json:"retention"`
-	MaxConsumers int              `json:"max_consumers"`
-	MaxMsgs      int64            `json:"max_msgs"`
-	MaxBytes     int64            `json:"max_bytes"`
-	MaxAge       time.Duration    `json:"max_age"`
-	MaxMsgsPer   int64            `json:"max_msgs_per_subject"`
+	MaxConsumers int              `json:"max_consumers,omitempty"`
+	MaxMsgs      int64            `json:"max_msgs,omitempty"`
+	MaxBytes     int64            `json:"max_bytes,omitempty"`
+	MaxAge       time.Duration    `json:"max_age,omitempty"`
+	MaxMsgsPer   int64            `json:"max_msgs_per_subject,omitempty"`
 	MaxMsgSize   int32            `json:"max_msg_size,omitempty"`
 	Discard      DiscardPolicy    `json:"discard"`
 	Storage      StorageType      `json:"storage"`
 	Replicas     int              `json:"num_replicas"`
 	NoAck        bool             `json:"no_ack,omitempty"`
-	Template     string           `json:"template_owner,omitempty"` // Deprecated: stream templates are deprecated and will be removed in a future version.
 	Duplicates   time.Duration    `json:"duplicate_window,omitempty"`
 	Placement    *Placement       `json:"placement,omitempty"`
 	Mirror       *StreamSource    `json:"mirror,omitempty"`
 	Sources      []*StreamSource  `json:"sources,omitempty"`
-	Compression  StoreCompression `json:"compression"`
+	Compression  StoreCompression `json:"compression,omitempty"`
 	FirstSeq     uint64           `json:"first_seq,omitempty"`
 
 	// Allow applying a subject transform to incoming messages before doing anything else
@@ -78,9 +77,9 @@ type StreamConfig struct {
 	RePublish *RePublish `json:"republish,omitempty"`
 
 	// Allow higher performance, direct access to get individual messages. E.g. KeyValue
-	AllowDirect bool `json:"allow_direct"`
+	AllowDirect bool `json:"allow_direct,omitempty"`
 	// Allow higher performance and unified direct access for mirrors as well.
-	MirrorDirect bool `json:"mirror_direct"`
+	MirrorDirect bool `json:"mirror_direct,omitempty"`
 
 	// Allow KV like semantics to also discard new on a per subject basis
 	DiscardNewPer bool `json:"discard_new_per_subject,omitempty"`
@@ -88,23 +87,23 @@ type StreamConfig struct {
 	// Optional qualifiers. These can not be modified after set to true.
 
 	// Sealed will seal a stream so no messages can get out or in.
-	Sealed bool `json:"sealed"`
+	Sealed bool `json:"sealed,omitempty"`
 	// DenyDelete will restrict the ability to delete messages.
-	DenyDelete bool `json:"deny_delete"`
+	DenyDelete bool `json:"deny_delete,omitempty"`
 	// DenyPurge will restrict the ability to purge messages.
-	DenyPurge bool `json:"deny_purge"`
+	DenyPurge bool `json:"deny_purge,omitempty"`
 	// AllowRollup allows messages to be placed into the system and purge
 	// all older messages using a special msg header.
-	AllowRollup bool `json:"allow_rollup_hdrs"`
+	AllowRollup bool `json:"allow_rollup_hdrs,omitempty"`
 
 	// The following defaults will apply to consumers when created against
 	// this stream, unless overridden manually.
 	// TODO(nat): Can/should we name these better?
-	ConsumerLimits StreamConsumerLimits `json:"consumer_limits"`
+	ConsumerLimits StreamConsumerLimits `json:"consumer_limits,omitempty"`
 
 	// AllowMsgTTL allows header initiated per-message TTLs. If disabled,
 	// then the `NATS-TTL` header will be ignored.
-	AllowMsgTTL bool `json:"allow_msg_ttl"`
+	AllowMsgTTL bool `json:"allow_msg_ttl,omitempty"`
 
 	// SubjectDeleteMarkerTTL sets the TTL of delete marker messages left behind by
 	// subject delete markers.
@@ -725,13 +724,6 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	}
 	js.mu.RUnlock()
 	jsa.mu.Lock()
-	// Check for template ownership if present.
-	if cfg.Template != _EMPTY_ && jsa.account != nil {
-		if !jsa.checkTemplateOwnership(cfg.Template, cfg.Name) {
-			jsa.mu.Unlock()
-			return nil, fmt.Errorf("stream not owned by template")
-		}
-	}
 
 	// If mirror, check if the transforms (if any) are valid.
 	if cfg.Mirror != nil {
@@ -1350,7 +1342,6 @@ func (mset *stream) setLastSeq(lseq uint64) {
 func (mset *stream) sendCreateAdvisory() {
 	mset.mu.RLock()
 	name := mset.cfg.Name
-	template := mset.cfg.Template
 	outq := mset.outq
 	srv := mset.srv
 	mset.mu.RUnlock()
@@ -1366,10 +1357,9 @@ func (mset *stream) sendCreateAdvisory() {
 			ID:   nuid.Next(),
 			Time: time.Now().UTC(),
 		},
-		Stream:   name,
-		Action:   CreateEvent,
-		Template: template,
-		Domain:   srv.getOpts().JetStreamDomain,
+		Stream: name,
+		Action: CreateEvent,
+		Domain: srv.getOpts().JetStreamDomain,
 	}
 
 	j, err := json.Marshal(m)
@@ -1392,10 +1382,9 @@ func (mset *stream) sendDeleteAdvisoryLocked() {
 			ID:   nuid.Next(),
 			Time: time.Now().UTC(),
 		},
-		Stream:   mset.cfg.Name,
-		Action:   DeleteEvent,
-		Template: mset.cfg.Template,
-		Domain:   mset.srv.getOpts().JetStreamDomain,
+		Stream: mset.cfg.Name,
+		Action: DeleteEvent,
+		Domain: mset.srv.getOpts().JetStreamDomain,
 	}
 
 	j, err := json.Marshal(m)
@@ -2115,13 +2104,6 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server, pedan
 		if old.Retention == WorkQueuePolicy || cfg.Retention == WorkQueuePolicy {
 			return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change retention policy to/from workqueue"))
 		}
-	}
-	// Can not have a template owner for now.
-	if old.Template != _EMPTY_ {
-		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update not allowed on template owned stream"))
-	}
-	if cfg.Template != _EMPTY_ {
-		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not be owned by a template"))
 	}
 	// Can not change from true to false.
 	if !cfg.Sealed && old.Sealed {
@@ -7801,11 +7783,6 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 		return nil, err
 	}
 
-	if cfg.Template != _EMPTY_ {
-		if err := jsa.addStreamNameToTemplate(cfg.Template, cfg.Name); err != nil {
-			return nil, err
-		}
-	}
 	mset, err := a.addStream(&cfg)
 	if err != nil {
 		// Make sure to clean up after ourselves here.
